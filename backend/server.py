@@ -160,3 +160,12 @@ async def chat(req: ChatRequest):
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/memory/{user_id}")
+async def get_memory(user_id: str):
+    """返回用户长期记忆（画像 + 体重历史），供前端预填表单与展示趋势。"""
+    return {
+        "profile": memory.get_profile(user_id),
+        "weight_history": memory.get_weight_history(user_id),
+    }

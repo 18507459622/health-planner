@@ -1,7 +1,7 @@
 <template>
-  <ChatView />
+  <Planner />
 </template>
 
 <script setup lang="ts">
-import ChatView from '@/views/ChatView.vue'
+import Planner from '@/views/Planner.vue'
 </script>

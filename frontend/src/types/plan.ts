@@ -86,3 +86,23 @@ export interface ChatMessage {
   text: string
   plan?: PlanJson | null
 }
+
+export interface StoredProfile {
+  gender: string
+  age: number | null
+  height_cm: number | null
+  weight_kg: number | null
+  goal: string
+  diseases: string[]
+  city: string
+}
+
+export interface WeightEntry {
+  weight: number
+  date: string
+}
+
+export interface MemoryResponse {
+  profile: StoredProfile | null
+  weight_history: WeightEntry[]
+}
