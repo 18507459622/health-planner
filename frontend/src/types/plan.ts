@@ -80,3 +80,9 @@ export interface PlanEvent {
   content: string
   final: boolean
 }
+
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  text: string
+  plan?: PlanJson | null
+}

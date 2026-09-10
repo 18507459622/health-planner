@@ -1,14 +1,16 @@
 # 🧘 健康计划生成助手（Health Planner）
 
-基于 **LangGraph 多智能体协作**的健康计划生成系统：输入身体指标（性别/年龄/身高/体重）与健康目标（减脂/增肌/养生），6 个专职 Agent 协作生成「饮食 + 运动 + 作息」结构化健康计划，并内置**三层安全护栏**（风险识别 + 就医建议 + 免责声明）。
+基于 **LangGraph 多智能体协作 + 分层记忆**的对话式健康计划助手：输入身体信息与健康目标，6 个专职 Agent 协作生成「饮食 + 运动 + 作息」结构化健康计划；支持**对话式追问调整**，内置**三层安全护栏**与**短期 / 长期分层记忆**。
 
 > 参照 Datawhale「Hello-Agents」教程第十三章「智能旅行助手」的多智能体架构改造而来。
 
 ## ✨ 特性
 
-- 🤖 **6-Agent 多智能体编排**：画像解析 → 健康评估 →（膳食 / 运动 / 作息三路**并行**）→ 计划合成
-- 🛡️ **三层安全护栏**：确定性规则预判 + LLM 判断 + 免责声明强制注入，高风险输入必提示就医
-- 🔧 **MCP 工具集成**：FastMCP 暴露 6 个本地健康工具，`MultiServerMCPClient` 注入智能体
+- 🤖 **6-Agent 多智能体编排** + 🧭 **意图路由**（首次生成 / 追问调整自动分流）
+- 💬 **对话式交互**：生成计划后可追问「把运动强度调低」，基于上一版计划增量调整
+- 🧠 **分层记忆**：短期（会话多轮）+ 长期（画像 / 体重历史 / 上一版计划），跨会话持久化
+- 🛡️ **三层安全护栏**：确定性规则预判 + LLM 判断 + 免责声明强制注入
+- 🔧 **MCP 工具集成**：FastMCP 暴露 6 个本地健康工具
 - ⚡ **SSE 流式**：后端逐节点推送进度，前端实时可视化
 - 📊 **自研评测体系**：单模型 vs 多智能体对比 + 客观校验
 
@@ -16,28 +18,43 @@
 
 | 层 | 技术 |
 |---|---|
-| 编排 | LangGraph（有向图 + 三路并行 fan-out） |
+| 编排 | LangGraph（意图路由 + 三路并行 fan-out） |
 | 大模型 | DeepSeek（`langchain_openai.ChatOpenAI`） |
 | 工具 | MCP（`FastMCP` + `MultiServerMCPClient`） |
+| 记忆 | Redis（`fakeredis` 内存引擎，可切真 Redis） |
 | 后端 | FastAPI + SSE 流式 |
 | 前端 | Vue3 + TypeScript + Element Plus |
 
 ## 🤖 多智能体架构
 
 ```
-START → 画像解析 → 健康评估 ─┬─ 膳食规划 ─┐
-                            ├─ 运动规划 ─┼→ 计划合成 → END
-                            └─ 作息规划 ─┘
+START ─┬─ generate → 画像解析 → 健康评估 ─┬─ 膳食规划 ─┐
+       │                                 ├─ 运动规划 ─┼→ 计划合成 → END
+       │                                 └─ 作息规划 ─┘
+       └─ adjust   → 计划调整（基于上一版计划 + 追问）──────────→ END
 ```
 
 | Agent | 职责 | MCP 工具 |
 |---|---|---|
-| 👤 画像解析 | 输入 → 结构化画像 | — |
+| 🧭 意图路由 | 首次生成 / 追问调整分流（规则） | — |
+| 👤 画像解析 | 自然语言 → 结构化画像（JSON） | — |
 | 🩺 健康评估 | BMI + 风险把关 + 就医建议 | calculate_bmi, query_health_knowledge |
 | 🥗 膳食规划 | 热量/宏量/三餐 | query_food_nutrition, query_health_knowledge |
 | 🏃 运动规划 | 一周运动计划 | get_exercise_guidance, get_weather, query_health_knowledge |
 | 🌙 作息规划 | 睡眠/节律 | get_sleep_guidance, query_health_knowledge |
 | 📋 计划合成 | 汇总 → 结构化 JSON | — |
+| 🔧 计划调整 | 基于上一版计划增量调整 | — |
+
+## 🧠 分层记忆
+
+| 记忆 | 范围 | Key | 内容 | 过期 |
+|---|---|---|---|---|
+| 短期 | 会话级 | `session:{sid}:messages` | 多轮对话 | 1 小时 |
+| 长期 | 用户级 | `user:{uid}:profile` | 用户画像 | 不过期 |
+| 长期 | 用户级 | `user:{uid}:weight_history` | 体重历史趋势 | 不过期 |
+| 长期 | 用户级 | `user:{uid}:last_plan` | 上一版计划 | 不过期 |
+
+存储引擎用 `fakeredis`（redis-py 标准 API），通过 `REDIS_URL` 环境变量可无缝切换真 Redis——开发用内存引擎、生产切真 Redis。
 
 ## 🛡️ 安全护栏（三层）
 
@@ -53,18 +70,19 @@ START → 画像解析 → 健康评估 ─┬─ 膳食规划 ─┐
 health-planner/
 ├── backend/
 │   ├── mcp_health_server.py   # FastMCP 6 个 mock 工具
-│   ├── health_graph.py        # LangGraph 编排核心（三路并行）
+│   ├── health_graph.py        # LangGraph 编排（意图路由 + 三路并行 + 调整）
+│   ├── memory.py              # 分层记忆（fakeredis，可切真 Redis）
 │   ├── state.py               # State + 初始状态
-│   ├── prompts.py             # 6 个 system prompt
+│   ├── prompts.py             # 各 Agent system prompt
 │   ├── safety.py              # 安全护栏
-│   ├── cli.py                 # 命令行版
-│   ├── server.py              # FastAPI + SSE
+│   ├── cli.py                 # 命令行对话版
+│   ├── server.py              # FastAPI + SSE（/api/chat）
 │   └── eval.py                # 评测（单模型 vs 多智能体）
 └── frontend/
     └── src/
-        ├── views/Planner.vue
-        ├── components/        # ProfileForm / ProgressSteps / RiskBanner / PlanCard
-        └── api/sse.ts         # fetch + ReadableStream 解析 SSE
+        ├── views/ChatView.vue         # 聊天界面
+        ├── components/                # RiskBanner / PlanCard
+        └── api/sse.ts                 # fetch + ReadableStream 解析 SSE
 ```
 
 ## 🚀 快速开始
@@ -78,7 +96,7 @@ py -3.12 -m venv .venv
 cp .env.example .env          # 填入 DEEPSEEK_API_KEY
 ```
 
-### 2. 命令行跑通（调试用）
+### 2. 命令行对话版（调试用）
 
 ```bash
 .venv/Scripts/python.exe cli.py
@@ -88,6 +106,7 @@ cp .env.example .env          # 填入 DEEPSEEK_API_KEY
 
 ```bash
 .venv/Scripts/python.exe -m uvicorn server:app --reload
+# 接口：POST http://127.0.0.1:8000/api/chat
 ```
 
 ### 4. 前端
@@ -124,6 +143,7 @@ cd ../backend
 - **DeepSeek 限流**：三路并行会同时多次调用 LLM，遇到限流（请求卡住）等几分钟自动恢复，或把 `health_graph.py` 的 `PARALLEL` 改为 `False` 退串行。
 - **MCP stdio**：`mcp_health_server.py` 内禁止 `print`（会污染 stdio 握手）。
 - **Windows venv**：本机 `python` 可能指向别的项目 venv，务必用 `.venv/Scripts/python.exe` 绝对路径。
+- **记忆存储**：默认 `fakeredis` 内存引擎，服务重启即清空；设 `REDIS_URL` 环境变量可持久化到真 Redis。
 
 ## 📄 免责声明
 

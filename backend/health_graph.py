@@ -1,21 +1,23 @@
-"""健康计划生成助手 - LangGraph 编排核心。
+"""健康计划生成助手 - LangGraph 编排核心（含记忆）。
 
 技术亮点：
-1. LangGraph —— 用「图」编排多智能体工作流，支持并行 fan-out（膳食/运动/作息三路并行）
+1. LangGraph —— 用「图」编排多智能体工作流：意图路由 + 三路并行 fan-out
 2. MCP —— 为多个智能体接入本地健康工具（BMI 计算 / 健康知识 / 食物营养 / 运动指南等）
+3. 记忆 —— 短期（会话多轮）+ 长期（画像 / 体重历史 / 上一版计划）分层记忆
 
 工作流图：
-  START → 画像解析 → 健康评估 ─┬─ 膳食规划 ─┐
-                              ├─ 运动规划 ─┼→ 计划合成 → END
-                              └─ 作息规划 ─┘
+  START ─┬─ generate → 画像解析 → 健康评估 ─┬─ 膳食规划 ─┐
+         │                                ├─ 运动规划 ─┼→ 计划合成 → END
+         │                                └─ 作息规划 ─┘
+         └─ adjust   → 计划调整（基于上一版计划 + 追问）──────────→ END
 
 运行：.venv/Scripts/python.exe cli.py（命令行）或 server.py（Web）
 """
 
 import json
 import os
+import re
 import sys
-from typing import TypedDict
 
 # Windows 控制台默认 GBK，emoji 会报 UnicodeEncodeError；强制 UTF-8 输出
 for _s in (sys.stdout, sys.stderr):
@@ -54,6 +56,19 @@ if not API_KEY:
     sys.exit(1)
 
 
+# ---------- 0. 意图判断（规则路由：首次生成 vs 追问调整） ----------
+_INTENT_PATTERN = re.compile(r"(身高|体重|\d+\s*(cm|kg|公斤|斤)|减脂|增肌|养生)")
+
+
+def detect_intent(message: str, last_plan: str) -> str:
+    """规则判断意图：含画像/目标关键词 → 首次生成；有上一版计划 → 追问调整。"""
+    if _INTENT_PATTERN.search(message):
+        return "generate"
+    if last_plan:
+        return "adjust"
+    return "generate"
+
+
 # ---------- 1. 大模型工厂 ----------
 def make_llm(temperature: float = 0.7, json_mode: bool = False) -> ChatOpenAI:
     kwargs: dict = {"max_retries": 3}
@@ -80,10 +95,23 @@ def show(title: str, content: str, preview: int | None = None) -> None:
 # ---------- 2. 各节点 ----------
 def profile_parser_node(state: State) -> dict:
     print("\n👤 画像解析 工作中...")
-    llm = make_llm(0.2)
-    resp = llm.invoke([SystemMessage(PROMPTS["profile_parser"]), HumanMessage(state["profile_raw"])])
-    show("👤 画像解析 → 结构化画像", resp.content)
-    return {"profile": resp.content}
+    llm = make_llm(0.2, json_mode=True)
+    resp = llm.invoke([SystemMessage(PROMPTS["profile_parser"]), HumanMessage(state["message"])])
+    obj = extract_json(resp.content)
+    if obj is None:
+        obj = {"raw": state["message"]}
+    profile_input = {
+        "gender": obj.get("gender") or "未知",
+        "age": obj.get("age"),
+        "height_cm": obj.get("height_cm"),
+        "weight_kg": obj.get("weight_kg"),
+        "goal": obj.get("goal") or "未知",
+        "diseases": obj.get("diseases") or [],
+        "city": obj.get("city") or "未知",
+    }
+    profile_text = json.dumps(obj, ensure_ascii=False, indent=2)
+    show("👤 画像解析 → 结构化画像", profile_text)
+    return {"profile": profile_text, "profile_input": profile_input}
 
 
 async def health_assessor_node(state: State) -> dict:
@@ -92,6 +120,7 @@ async def health_assessor_node(state: State) -> dict:
     rule = rule_based_risk(state["profile_input"])
     prompt = (
         f"用户画像：\n{state['profile']}\n\n"
+        f"【用户历史记录】\n{state['user_context'] or '无'}\n\n"
         f"【确定性预判结果（供参考，与你的判断冲突时以更严格者为准）】\n"
         f"BMI={rule['bmi']}，风险等级={rule['risk_level']}，是否需要就医={rule['need_medical']}\n\n"
         f"请调用 calculate_bmi 计算 BMI、query_health_knowledge 查询相关健康知识，输出评估报告。"
@@ -185,6 +214,42 @@ def plan_composer_node(state: State) -> dict:
     return {"final_json": final}
 
 
+def adjust_planner_node(state: State) -> dict:
+    print("\n🔧 计划调整 工作中（基于上一版计划）...")
+    llm = make_llm(0.4, json_mode=True)
+    # 短期记忆：最近几轮对话，帮助理解连续追问的上下文
+    history_text = "\n".join(
+        f"{m['role']}: {str(m['content'])[:200]}" for m in state["history"][-6:]
+    )
+    prompt = (
+        f"【最近对话】\n{history_text or '无'}\n\n"
+        f"上一版健康计划（JSON）：\n{state['last_plan']}\n\n"
+        f"用户的调整需求：{state['message']}"
+    )
+    obj = None
+    raw = ""
+    for _ in range(2):
+        resp = llm.invoke([SystemMessage(PROMPTS["adjust_planner"]), HumanMessage(prompt)])
+        raw = resp.content
+        obj = extract_json(raw)
+        if obj is not None:
+            break
+    if obj is None:
+        obj = extract_json(state["last_plan"]) or {"raw": raw}
+
+    # 免责声明强制注入 + 风险结论回填（仅当有画像信息时）
+    obj = ensure_disclaimer(obj)
+    rule = rule_based_risk(state["profile_input"])
+    if rule["bmi"] is not None or rule["diseases"]:
+        obj.setdefault("risk", {})
+        obj["risk"]["level"] = rule["risk_level"]
+        obj["risk"]["need_medical"] = rule["need_medical"]
+
+    final = json.dumps(obj, ensure_ascii=False, indent=2)
+    show("🔧 计划调整 → 最终 JSON", final, preview=600)
+    return {"final_json": final}
+
+
 # ---------- 3. 带工具的 Agent（在 build_graph 里用 MCP 工具初始化） ----------
 ASSESSOR_AGENT = None
 DIET_AGENT = None
@@ -219,12 +284,15 @@ def build_graph(tools):
     g.add_node("exercise_planner", exercise_planner_node)
     g.add_node("lifestyle_planner", lifestyle_planner_node)
     g.add_node("plan_composer", plan_composer_node)
+    g.add_node("adjust_planner", adjust_planner_node)
 
-    g.add_edge(START, "profile_parser")
+    # 意图路由：首次生成走完整流程，追问调整走调整节点
+    g.add_conditional_edges(
+        START, lambda s: s["intent"], {"generate": "profile_parser", "adjust": "adjust_planner"}
+    )
     g.add_edge("profile_parser", "health_assessor")
 
     if PARALLEL:
-        # 三路并行 fan-out → fan-in
         g.add_edge("health_assessor", "diet_planner")
         g.add_edge("health_assessor", "exercise_planner")
         g.add_edge("health_assessor", "lifestyle_planner")
@@ -232,11 +300,11 @@ def build_graph(tools):
         g.add_edge("exercise_planner", "plan_composer")
         g.add_edge("lifestyle_planner", "plan_composer")
     else:
-        # 串行退路
         g.add_edge("health_assessor", "diet_planner")
         g.add_edge("diet_planner", "exercise_planner")
         g.add_edge("exercise_planner", "lifestyle_planner")
         g.add_edge("lifestyle_planner", "plan_composer")
 
     g.add_edge("plan_composer", END)
+    g.add_edge("adjust_planner", END)
     return g.compile()

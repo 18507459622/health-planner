@@ -85,10 +85,21 @@ def single_model_generate(profile_input: dict) -> str:
     return json.dumps(ensure_disclaimer(obj), ensure_ascii=False, indent=2)
 
 
+def format_profile_message(p: dict) -> str:
+    """把结构化画像转成自然语言消息，供画像解析提取。"""
+    diseases = "、".join(p.get("diseases") or []) or "无"
+    return (
+        f"我{p.get('gender', '男')}，{p.get('age', 28)}岁，身高{p.get('height_cm', 175)}cm，"
+        f"体重{p.get('weight_kg', 82)}kg，想{p.get('goal', '减脂')}，"
+        f"基础疾病：{diseases}，在{p.get('city', '北京')}。"
+    )
+
+
 async def multi_agent_generate(tools, profile_input: dict) -> str:
     """多智能体：跑完整 LangGraph 流水线。"""
     graph = hg.build_graph(tools)
-    result = await graph.ainvoke(initial_state(profile_input))
+    message = format_profile_message(profile_input)
+    result = await graph.ainvoke(initial_state(message=message, intent="generate"))
     return result["final_json"]
 
 

@@ -1,4 +1,4 @@
-"""健康计划生成助手 - Web 版（FastAPI + SSE 流式）。
+"""健康计划生成助手 - Web 版（FastAPI + SSE 流式 + 记忆）。
 
 运行：
   .venv/Scripts/python.exe -m uvicorn server:app --reload
@@ -24,6 +24,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel, Field
 
 import health_graph as hg
+import memory
 from state import initial_state
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,17 +37,16 @@ NODES = {
     "exercise_planner": ("🏃", "运动规划", "exercise_plan"),
     "lifestyle_planner": ("🌙", "作息规划", "lifestyle_plan"),
     "plan_composer": ("📋", "计划合成", "final_json"),
+    "adjust_planner": ("🔧", "计划调整", "final_json"),
 }
 
+FINAL_NODES = {"plan_composer", "adjust_planner"}
 
-class PlanRequest(BaseModel):
-    gender: str = "男"
-    age: int = Field(28, ge=1, le=120)
-    height_cm: float = Field(175, ge=100, le=250)
-    weight_kg: float = Field(82, ge=30, le=300)
-    goal: str = "减脂"
-    diseases: list[str] = []
-    city: str = "北京"
+
+class ChatRequest(BaseModel):
+    session_id: str = ""
+    user_id: str = "default"
+    message: str = Field(..., min_length=1)
 
 
 @asynccontextmanager
@@ -70,14 +70,51 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="健康计划生成助手", lifespan=lifespan)
 
 
-@app.post("/api/generate")
-async def generate(req: PlanRequest):
-    """SSE 流式接口：每完成一个节点就推一条消息。"""
+def sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def build_user_context(user_id: str, profile_input: dict) -> str:
+    """把长期记忆（历史画像 + 体重历史）拼成文本，供健康评估引用趋势。"""
+    parts = []
+    if profile_input:
+        parts.append("历史画像：" + json.dumps(profile_input, ensure_ascii=False))
+    wh = memory.get_weight_history(user_id)
+    if wh:
+        parts.append("体重历史：" + "; ".join(f"{x['date']} {x['weight']}kg" for x in wh))
+    return "\n".join(parts)
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """SSE 流式对话接口：加载记忆 → 意图路由 → 跑图 → 保存记忆。"""
     graph = app.state.graph
-    profile_input = req.model_dump()
+    history = memory.get_history(req.session_id)
+    last_plan = memory.get_last_plan(req.user_id) or ""
+    profile_input = memory.get_profile(req.user_id) or {}
+    user_context = build_user_context(req.user_id, profile_input)
+    intent = hg.detect_intent(req.message, last_plan)
 
     async def event_stream():
-        async for update in graph.astream(initial_state(profile_input), stream_mode="updates"):
+        # 1. 意图事件
+        yield sse({"node": "intent", "name": "意图判断", "content": intent, "intent": intent})
+
+        initial = initial_state(
+            message=req.message,
+            session_id=req.session_id,
+            user_id=req.user_id,
+            history=history,
+            last_plan=last_plan,
+            profile_input=profile_input,
+            user_context=user_context,
+            intent=intent,
+        )
+
+        new_profile_input = None
+        final_json = ""
+
+        # 2. 节点进度 + 最终计划
+        async for update in graph.astream(initial, stream_mode="updates"):
             for node_name, node_output in update.items():
                 emoji, name, key = NODES.get(node_name, ("🤖", node_name, None))
                 if key is None:
@@ -85,14 +122,32 @@ async def generate(req: PlanRequest):
                 content = node_output.get(key, "")
                 if not content:
                     continue
-                payload = {
+                if node_name == "profile_parser":
+                    new_profile_input = node_output.get("profile_input")
+                is_final = node_name in FINAL_NODES
+                if is_final:
+                    final_json = content
+                yield sse({
                     "node": node_name,
                     "emoji": emoji,
                     "name": name,
                     "content": content,
-                    "final": node_name == "plan_composer",
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    "final": is_final,
+                })
+
+        # 3. 保存记忆（短期 + 长期）
+        memory.append_message(req.session_id, "user", req.message)
+        if final_json:
+            memory.append_message(req.session_id, "assistant", final_json)
+            memory.save_last_plan(req.user_id, final_json)
+            if new_profile_input:
+                memory.save_profile(req.user_id, new_profile_input)
+                w = new_profile_input.get("weight_kg")
+                if w:
+                    try:
+                        memory.append_weight(req.user_id, float(w))
+                    except (TypeError, ValueError):
+                        pass
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

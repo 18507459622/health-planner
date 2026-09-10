@@ -7,3 +7,5 @@ langchain-mcp-adapters>=0.1.0
 mcp>=1.0.0
 fastapi>=0.110.0
 uvicorn>=0.30.0
+redis>=5.0.0
+fakeredis>=2.20.0

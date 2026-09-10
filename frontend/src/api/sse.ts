@@ -1,17 +1,23 @@
-import type { PlanEvent, PlanJson, ProfileInput } from '@/types/plan'
+import type { PlanEvent, PlanJson } from '@/types/plan'
 
 export interface StreamHandlers {
+  onIntent: (intent: string) => void
   onStep: (e: PlanEvent) => void
   onDone: (plan: PlanJson) => void
   onError: (msg: string) => void
 }
 
 /** fetch + ReadableStream 解析 SSE（POST + JSON body，EventSource 不支持）。 */
-export async function streamPlan(payload: ProfileInput, handlers: StreamHandlers): Promise<void> {
-  const resp = await fetch('/api/generate', {
+export async function streamChat(
+  message: string,
+  sessionId: string,
+  userId: string,
+  handlers: StreamHandlers,
+): Promise<void> {
+  const resp = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ session_id: sessionId, user_id: userId, message }),
   })
 
   if (!resp.ok || !resp.body) {
@@ -35,11 +41,13 @@ export async function streamPlan(payload: ProfileInput, handlers: StreamHandlers
       const data = dataLine.slice(5).trim()
       if (!data || data === '[DONE]') continue
       try {
-        const e = JSON.parse(data) as PlanEvent
-        if (e.final) {
+        const e = JSON.parse(data) as { node: string; intent?: string; content: string; final: boolean }
+        if (e.node === 'intent') {
+          handlers.onIntent(String(e.intent ?? ''))
+        } else if (e.final) {
           handlers.onDone(JSON.parse(e.content) as PlanJson)
         } else {
-          handlers.onStep(e)
+          handlers.onStep(e as PlanEvent)
         }
       } catch {
         // 忽略无法解析的块

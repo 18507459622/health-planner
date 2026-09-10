@@ -6,10 +6,16 @@ from typing import TypedDict
 
 class State(TypedDict):
     # 输入
-    profile_raw: str      # 供 LLM 阅读的文本描述（由结构化输入格式化而来）
-    profile_input: dict   # 结构化输入（确定性规则计算用，如 BMI/疾病识别）
+    message: str          # 当前用户消息（自然语言）
+    session_id: str       # 会话 ID（短期记忆 key）
+    user_id: str          # 用户 ID（长期记忆 key）
+    history: list         # 短期记忆：当前会话多轮对话 [{role, content}]
+    last_plan: str        # 长期记忆：上一版计划 JSON 字符串
+    profile_input: dict   # 结构化画像（generate 时由画像解析提取；adjust 时从长期记忆加载）
+    user_context: str     # 长期记忆文本（历史体重趋势 + 旧画像），供健康评估引用
+    intent: str           # generate（首次生成） / adjust（追问调整）
     # 中间产物
-    profile: str          # 画像解析结果
+    profile: str          # 画像文本
     assessment: str       # 健康评估报告
     risk_level: str       # low / medium / high
     need_medical: bool    # 是否建议就医
@@ -20,26 +26,26 @@ class State(TypedDict):
     final_json: str       # 最终 JSON 字符串
 
 
-def format_profile(p: dict) -> str:
-    """把结构化输入格式化成一段文本，供 LLM 阅读。"""
-    diseases = "、".join(d for d in (p.get("diseases") or []) if d) or "无"
-    parts = [
-        f"性别：{p.get('gender', '未知')}",
-        f"年龄：{p.get('age', '未知')}",
-        f"身高：{p.get('height_cm', '未知')}cm",
-        f"体重：{p.get('weight_kg', '未知')}kg",
-        f"健康目标：{p.get('goal', '未知')}",
-        f"基础疾病：{diseases}",
-        f"所在城市：{p.get('city', '未知')}",
-    ]
-    return "\n".join(parts)
-
-
-def initial_state(profile_input: dict) -> dict:
+def initial_state(
+    message: str,
+    session_id: str = "",
+    user_id: str = "default",
+    history: list | None = None,
+    last_plan: str = "",
+    profile_input: dict | None = None,
+    user_context: str = "",
+    intent: str = "generate",
+) -> dict:
     """构造完整初始状态。"""
     return {
-        "profile_raw": format_profile(profile_input),
-        "profile_input": profile_input,
+        "message": message,
+        "session_id": session_id,
+        "user_id": user_id,
+        "history": history or [],
+        "last_plan": last_plan,
+        "profile_input": profile_input or {},
+        "user_context": user_context,
+        "intent": intent,
         "profile": "",
         "assessment": "",
         "risk_level": "low",

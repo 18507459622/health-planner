@@ -1,13 +1,13 @@
-"""命令行版健康计划生成助手（方便调试全链路）。
+"""命令行版健康计划生成助手（对话式，支持多轮追问 + 记忆）。
 
 运行：
   .venv/Scripts/python.exe cli.py
 """
 
 import asyncio
-import json
 import os
 import sys
+import uuid
 
 # Windows 控制台默认 GBK，emoji 会报 UnicodeEncodeError；强制 UTF-8 输出
 for _s in (sys.stdout, sys.stderr):
@@ -20,26 +20,26 @@ for _s in (sys.stdout, sys.stderr):
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 import health_graph as hg
+import memory
 from state import initial_state
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def ask_float(prompt: str, default: float) -> float:
-    raw = input(prompt).strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
+def build_user_context(user_id: str, profile_input: dict) -> str:
+    parts = []
+    if profile_input:
+        parts.append("历史画像：" + str(profile_input))
+    wh = memory.get_weight_history(user_id)
+    if wh:
+        parts.append("体重历史：" + "; ".join(f"{x['date']} {x['weight']}kg" for x in wh))
+    return "\n".join(parts)
 
 
 async def main():
-    print("🧘 健康计划生成助手（LangGraph + MCP 多智能体）")
+    print("🧘 健康计划生成助手（LangGraph + MCP + 分层记忆）")
     print("-" * 60)
 
-    # 连接 MCP 服务器，加载工具
     client = MultiServerMCPClient({
         "health": {
             "transport": "stdio",
@@ -52,36 +52,61 @@ async def main():
     print(f"✅ 已通过 MCP 加载 {len(tools)} 个工具：{[t.name for t in tools]}")
     graph = hg.build_graph(tools)
 
-    # 收集输入（都有默认值，方便快速回车跑通）
-    gender = input("性别（男/女，回车默认：男）：").strip() or "男"
-    age = int(input("年龄（回车默认：28）：").strip() or "28")
-    height = ask_float("身高 cm（回车默认：175）：", 175)
-    weight = ask_float("体重 kg（回车默认：82）：", 82)
-    goal = input("健康目标（减脂/增肌/养生，回车默认：减脂）：").strip() or "减脂"
-    diseases_raw = input("基础疾病（逗号分隔，无则回车）：").strip()
-    diseases = [d.strip() for d in diseases_raw.split(",") if d.strip()] if diseases_raw else []
-    city = input("所在城市（回车默认：北京）：").strip() or "北京"
+    session_id = uuid.uuid4().hex[:8]
+    user_id = input("用户 ID（回车默认 default）：").strip() or "default"
 
-    profile_input = {
-        "gender": gender, "age": age, "height_cm": height, "weight_kg": weight,
-        "goal": goal, "diseases": diseases, "city": city,
-    }
+    print(f"\n会话已建立（session={session_id}）。")
+    print("输入身体信息生成计划，之后可继续追问调整（如「把运动强度调低」）。")
+    print("示例：我男28岁175cm82kg想减脂；输入 q 退出。\n")
 
-    print("\n🚀 多智能体流水线启动...")
-    result = await graph.ainvoke(initial_state(profile_input))
+    while True:
+        message = input("👤 你：").strip()
+        if not message:
+            continue
+        if message.lower() == "q":
+            print("👋 再见！")
+            break
 
-    print("\n" + "=" * 60)
-    print("  📋 最终健康计划（JSON）")
-    print("=" * 60)
-    print(result["final_json"])
+        history = memory.get_history(session_id)
+        last_plan = memory.get_last_plan(user_id) or ""
+        profile_input = memory.get_profile(user_id) or {}
+        user_context = build_user_context(user_id, profile_input)
+        intent = hg.detect_intent(message, last_plan)
+        print(f"\n🧭 意图：{'首次生成' if intent == 'generate' else '追问调整'}")
 
-    # 保存
-    out_dir = os.path.join(HERE, "output")
-    os.makedirs(out_dir, exist_ok=True)
-    filename = os.path.join(out_dir, f"{goal}-计划.json")
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(result["final_json"])
-    print(f"\n✅ 完成！计划已保存到：{filename}")
+        initial = initial_state(
+            message=message,
+            session_id=session_id,
+            user_id=user_id,
+            history=history,
+            last_plan=last_plan,
+            profile_input=profile_input,
+            user_context=user_context,
+            intent=intent,
+        )
+        result = await graph.ainvoke(initial)
+        final_json = result.get("final_json", "")
+
+        # 保存记忆（短期 + 长期）
+        memory.append_message(session_id, "user", message)
+        if final_json:
+            memory.append_message(session_id, "assistant", final_json)
+            memory.save_last_plan(user_id, final_json)
+            new_profile = result.get("profile_input") or {}
+            if intent == "generate" and new_profile:
+                memory.save_profile(user_id, new_profile)
+                w = new_profile.get("weight_kg")
+                if w:
+                    try:
+                        memory.append_weight(user_id, float(w))
+                    except (TypeError, ValueError):
+                        pass
+
+        print("\n" + "=" * 60)
+        print("  📋 健康计划（JSON）")
+        print("=" * 60)
+        print(final_json)
+        print("\n（继续输入可追问调整；输入 q 退出）\n")
 
 
 if __name__ == "__main__":
