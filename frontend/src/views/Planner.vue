@@ -29,7 +29,6 @@
           <el-divider />
           <div class="export-row">
             <span class="export-label">导出计划：</span>
-            <el-button size="small" type="primary" @click="exportPdf">PDF (.pdf)</el-button>
             <el-button size="small" @click="exportMd">Markdown (.md)</el-button>
             <el-button size="small" @click="exportTxt">纯文本 (.txt)</el-button>
           </div>
@@ -46,7 +45,7 @@ import ProgressSteps from '@/components/ProgressSteps.vue'
 import RiskBanner from '@/components/RiskBanner.vue'
 import PlanCard from '@/components/PlanCard.vue'
 import { streamChat } from '@/api/sse'
-import { downloadFile, exportPlanPdf, planToMarkdown, planToText } from '@/utils/export'
+import { downloadFile, planToMarkdown, planToText } from '@/utils/export'
 import type { PlanJson, ProfileInput, StoredProfile, WeightEntry } from '@/types/plan'
 
 const loading = ref(false)
@@ -128,10 +127,6 @@ function handleAdjust() {
   if (!text || loading.value) return
   instruction.value = ''
   runFlow(text)
-}
-
-async function exportPdf() {
-  if (plan.value) await exportPlanPdf(plan.value)
 }
 
 function exportMd() {
