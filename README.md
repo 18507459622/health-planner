@@ -165,7 +165,34 @@ START ─┬─ generate → 画像解析 → 健康评估 → 🚦风险闸门 
 | 长期 | 用户级 | `user:{uid}:weight_history` | 体重历史趋势 | ⚠️ 目前不过期 |
 | 长期 | 用户级 | `user:{uid}:last_plan` | 上一版计划 | ⚠️ 目前不过期 |
 
-存储引擎用 `fakeredis`（redis-py 标准 API），通过 `REDIS_URL` 环境变量可无缝切换真 Redis。
+存储引擎由 `REDIS_URL` 环境变量决定（`memory.py` 用 redis-py 标准 API，两种模式代码完全一致）：
+
+| 模式 | 触发条件 | 数据活多久 |
+|---|---|---|
+| **真 Redis** | 设了 `REDIS_URL` | 跨服务重启、跨容器重启都在（配合 AOF） |
+| `fakeredis` | 没设 `REDIS_URL` | **进程内存，服务一重启就没了** |
+
+推荐用 Docker 起一个（Redis 只占几十 MB，不像 Milvus 那样吃内存）：
+
+```bash
+# 国内直连 Docker Hub 通常会超时，先用镜像源拉
+docker pull docker.m.daocloud.io/library/redis:7-alpine
+docker tag  docker.m.daocloud.io/library/redis:7-alpine redis:7-alpine
+
+# --appendonly yes 开 AOF；命名卷让数据在容器重建后仍在
+docker run -d --name health-planner-redis --restart unless-stopped \
+  -p 6379:6379 -v hp-redis-data:/data \
+  redis:7-alpine redis-server --appendonly yes
+```
+
+然后在 `backend/.env` 里写 `REDIS_URL=redis://localhost:6379/0`。
+
+**为什么不是 fakeredis**：它的数据存在 Python 进程内存里，服务一重启，用户画像、体重历史、会话多轮全丢。
+这与"分层记忆 / 跨会话个性化"这个卖点是直接冲突的——演示时重启一次就露馅。
+`fakeredis` 保留为默认值只是为了"clone 下来不装任何东西也能跑通"。
+
+> 注意：`session:*` 有 1 小时 TTL（短期记忆本来就该过期），
+> `user:*` 三个键**没有 TTL**（见「已知限制」）。
 
 ---
 
@@ -236,11 +263,16 @@ health-planner/
 ## 🚀 快速开始
 
 ```bash
+# 0. Redis（可选但推荐：不装的话记忆一重启就没了，见「分层记忆」）
+docker run -d --name health-planner-redis --restart unless-stopped \
+  -p 6379:6379 -v hp-redis-data:/data \
+  redis:7-alpine redis-server --appendonly yes
+
 # 1. 后端环境
 cd backend
 py -3.12 -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
-cp .env.example .env          # 填入 DEEPSEEK_API_KEY
+cp .env.example .env          # 填 DEEPSEEK_API_KEY；接了 Redis 就一并填 REDIS_URL
 
 # 2. 命令行版（最快验证人机协同：闸门会直接在终端里问你）
 .venv/Scripts/python.exe cli.py
@@ -320,7 +352,8 @@ cd .. && make test
 11. **DeepSeek 限流**：三路并行会同时多次调用 LLM，遇到限流（请求卡住）等几分钟自动恢复，或把 `health_graph.py` 的 `PARALLEL` 改为 `False` 退串行。
 12. **MCP stdio**：`mcp_health_server.py` 内禁止 `print`（会污染 stdio 握手）。
 13. **Windows venv**：本机 `python` 可能指向别的项目 venv，务必用 `.venv/Scripts/python.exe` 绝对路径。
-14. **默认 `fakeredis` 内存引擎**，服务重启记忆即清空；设 `REDIS_URL` 可切真 Redis。
+14. **`user:*` 三个长期键没有 TTL**，会无限增长；`session:*` 有 1 小时 TTL 是对的。用 `redis-cli ttl` 可以直接看到（`-1` = 永不过期）。
+15. **不设 `REDIS_URL` 时退回 `fakeredis`，记忆只活在进程内存里**，服务重启即清空。默认这样是为了"clone 下来零依赖能跑"，但**演示时应该接真 Redis**（见「分层记忆」一节）。
 
 ---
 
