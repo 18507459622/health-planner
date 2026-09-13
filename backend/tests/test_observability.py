@@ -191,6 +191,43 @@ class TestTimedNode:
         assert row["ok"] is False
         assert "KeyError" in row["error"]
 
+    def test_interrupt暂停不算节点失败(self, tmp_path):
+        """回归：`interrupt()` 靠抛 GraphBubbleUp 暂停整张图，那是控制流信号不是错误。
+
+        之前它被记成节点失败 —— 每一次人机协同都会在 failures_by_step 里
+        留一条假记录，把"失败发生在哪一步"这个问题污染掉。
+        """
+        from langgraph.errors import GraphBubbleUp
+
+        obs.new_trace("s1")
+
+        @obs.timed_node("confirm_gate")
+        def node(state):
+            raise GraphBubbleUp()
+
+        with pytest.raises(GraphBubbleUp):
+            node({})
+        row = read_jsonl(tmp_path)[-1]
+        assert row["ok"] is True, "暂停不应记为失败"
+        assert row["paused"] is True
+        assert "error" not in row
+        assert obs.snapshot()["failures_by_step"] == {}
+        assert obs.snapshot()["nodes"]["confirm_gate"]["failures"] == 0
+
+    def test_异步节点的interrupt同样不算失败(self):
+        from langgraph.errors import GraphBubbleUp
+
+        obs.new_trace("s1")
+
+        @obs.timed_node("risk_gate")
+        async def node(state):
+            raise GraphBubbleUp()
+
+        with pytest.raises(GraphBubbleUp):
+            asyncio.run(node({}))
+        assert obs.snapshot()["nodes"]["risk_gate"]["failures"] == 0
+        assert obs.snapshot()["failures_by_step"] == {}
+
     def test_函数名被保留(self):
         @obs.timed_node("x")
         def my_node(state):
@@ -397,6 +434,38 @@ class TestTraceQuery:
 
     def test_取不存在的trace返回空列表(self):
         assert obs.get_trace("nope") == []
+
+    def test_墙钟耗时用首末时间戳而不是跨度累加(self):
+        """回归：跨度累加会重复计算嵌套与并行。
+
+        节点耗时包含其内部的 LLM 与工具调用，三个规划节点又是并行跑的，
+        直接 sum(duration_ms) 会严重高估 —— 实测一次约 100 秒的请求被算成 278 秒。
+        """
+        obs.new_trace("s1")
+        # 三段各"耗时" 60 秒，但都是同一瞬间产生的（并行）
+        obs.log_event({"kind": "node", "name": "a", "ok": True, "duration_ms": 60000})
+        obs.log_event({"kind": "node", "name": "b", "ok": True, "duration_ms": 60000})
+        obs.log_event({"kind": "node", "name": "c", "ok": True, "duration_ms": 60000})
+        s = obs.recent_traces()[0]
+        assert s["span_sum_ms"] == 180000.0
+        assert s["wall_ms"] < 5000, "墙钟应是首末时间戳之差，不是跨度累加"
+
+    def test_暂停节点出现在paused_steps而不是failed_steps(self):
+        from langgraph.errors import GraphBubbleUp
+
+        obs.new_trace("s1")
+
+        @obs.timed_node("confirm_gate")
+        def gate(state):
+            raise GraphBubbleUp()
+
+        with pytest.raises(GraphBubbleUp):
+            gate({})
+        obs.log_event({"kind": "llm", "name": "llm_call", "ok": False, "error": "x"})
+        s = obs.recent_traces()[0]
+        assert s["failed_steps"] == ["llm_call"]
+        assert s["paused_steps"] == ["confirm_gate"]
+        assert "total_ms" not in s, "旧字段含义不清，已拆成 wall_ms / span_sum_ms"
 
     def test_recent_traces给出摘要与失败步骤(self):
         obs.new_trace("s1", "u1", "generate")

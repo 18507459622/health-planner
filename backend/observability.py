@@ -38,6 +38,13 @@ from pathlib import Path
 
 from langchain_core.callbacks import BaseCallbackHandler
 
+try:
+    from langgraph.errors import GraphBubbleUp
+except ImportError:  # pragma: no cover - langgraph 是运行依赖，这里只是让本模块可独立使用
+
+    class GraphBubbleUp(Exception):  # type: ignore[no-redef]
+        """兜底：没有 langgraph 时不会把任何异常误判成「暂停」。"""
+
 # ---------------------------------------------------------------- 配置
 
 _LOG_DIR = Path(os.getenv("TRACE_DIR", Path(__file__).resolve().parent.parent / "logs"))
@@ -207,9 +214,12 @@ def timed_node(name: str, fn=None):
             try:
                 result = await fn(state)
             except Exception as exc:  # noqa: BLE001
-                _record_node(name, started, ok=False, error=f"{type(exc).__name__}: {exc}")
+                _node_exception(name, started, exc)
                 raise
-            _record_node(name, started, ok=True, produced=sorted(result) if isinstance(result, dict) else None)
+            _record_node(
+                name, started, ok=True,
+                produced=sorted(result) if isinstance(result, dict) else None,
+            )
             return result
 
         return async_wrapper
@@ -220,12 +230,30 @@ def timed_node(name: str, fn=None):
         try:
             result = fn(state)
         except Exception as exc:  # noqa: BLE001
-            _record_node(name, started, ok=False, error=f"{type(exc).__name__}: {exc}")
+            _node_exception(name, started, exc)
             raise
-        _record_node(name, started, ok=True, produced=sorted(result) if isinstance(result, dict) else None)
+        _record_node(
+            name, started, ok=True,
+            produced=sorted(result) if isinstance(result, dict) else None,
+        )
         return result
 
     return wrapper
+
+
+def _node_exception(name: str, started: float, exc: Exception) -> None:
+    """区分「节点真的失败」与「节点被 interrupt 暂停」。
+
+    `interrupt()` 靠抛 `GraphBubbleUp` 来暂停整张图 —— 那是控制流信号，不是错误
+    （langgraph 源码注释：Never raised directly, or surfaced to the user）。
+    如果记成失败，**每一次人机协同都会在 failures_by_step 里留一条假记录**，
+    "失败发生在哪一步"这个问题就被污染了。
+    实测：一次正常的计划确认中断，会让 confirm_gate 出现在 trace 的 failed 列表里。
+    """
+    if isinstance(exc, GraphBubbleUp):
+        _record_node(name, started, ok=True, paused=True)
+    else:
+        _record_node(name, started, ok=False, error=f"{type(exc).__name__}: {exc}")
 
 
 def _record_node(name: str, started: float, ok: bool, **extra) -> None:
@@ -485,6 +513,23 @@ def get_trace(trace_id: str) -> list:
         return list(_EVENTS.get(trace_id, []))
 
 
+def _wall_ms(events: list) -> float:
+    """真实墙钟耗时：首末事件的 ts 之差。
+
+    不能用 `sum(duration_ms)` 代替 —— 节点耗时**包含**其内部的 LLM 与工具调用，
+    并行 fan-out 的三个节点又是同时跑的，累加会严重高估。
+    实测：一次实际约 100 秒的请求，累加出来是 278 秒。
+    """
+    if len(events) < 2:
+        return 0.0
+    try:
+        start = datetime.fromisoformat(events[0]["ts"])
+        end = datetime.fromisoformat(events[-1]["ts"])
+        return round((end - start).total_seconds() * 1000, 1)
+    except (KeyError, ValueError):
+        return 0.0
+
+
 def recent_traces(limit: int = 20) -> list:
     """最近 N 条 trace 的摘要，供 /api/traces 列表页使用。"""
     with _LOCK:
@@ -493,6 +538,7 @@ def recent_traces(limit: int = 20) -> list:
     for tid, events in items:
         req = next((e for e in events if e.get("kind") == "request"), {})
         failed = [e for e in events if e.get("ok") is False]
+        paused = [e for e in events if e.get("paused")]
         out.append(
             {
                 "trace_id": tid,
@@ -502,7 +548,11 @@ def recent_traces(limit: int = 20) -> list:
                 "intent": req.get("intent", ""),
                 "events": len(events),
                 "failed_steps": [e.get("name") for e in failed],
-                "total_ms": round(sum(e.get("duration_ms", 0) for e in events), 1),
+                "paused_steps": [e.get("name") for e in paused],
+                # 两个数都给，且名字说清各自是什么：墙钟是"用户等了多久"，
+                # 跨度累加是"总共花了多少计算时间"（并行时会大于墙钟）
+                "wall_ms": _wall_ms(events),
+                "span_sum_ms": round(sum(e.get("duration_ms", 0) for e in events), 1),
             }
         )
     return out
