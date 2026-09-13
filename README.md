@@ -18,7 +18,7 @@
 - 📈 **可观测性**：`trace_id` 贯穿请求 → 节点 → 模型 → 工具，结构化 JSONL 落盘；`/api/metrics` 直接回答"延迟多少、花了多少钱、失败在哪一步"
 - 🔧 **MCP 工具集成**：FastMCP 暴露 6 个本地健康工具
 - ⚡ **SSE 流式**：逐节点推送进度，前端实时可视化
-- ✅ **202 个单元测试**：含 8 个标了 `gap` 的"当前行为即缺口"快照用例
+- ✅ **207 个单元测试**：含 8 个标了 `gap` 的"当前行为即缺口"快照用例
 - 📊 **自研评测体系**：单模型 vs 多智能体对比 + 客观校验
 
 ---
@@ -203,28 +203,36 @@ make test          # 或：.venv/Scripts/python.exe -m pytest backend
 make test-gaps     # 只列已知缺口用例（= 待修清单）
 ```
 
-**202 个用例，全部通过：**
+**207 个用例，全部通过：**
 
 | 文件 | 用例数 | 覆盖内容 |
 |---|---|---|
 | `test_safety.py` | 92 | BMI 五档分级与三处边界、疾病强制升级、脏输入容错、取更严者、报告解析、JSON 兜底、免责声明、**护栏组合语义** |
 | `test_hitl.py` | 39 | 两个闸门的决策逻辑、fail-closed 方向、中断载荷字段、路由、中止分支 |
-| `test_observability.py` | 38 | trace 上下文传播、事件落盘、span、节点包装、LLM/工具回调、成本换算、聚合、fail-open |
+| `test_observability.py` | 43 | trace 上下文传播、事件落盘、span、节点包装、LLM/工具回调、成本换算、聚合、fail-open |
 | `test_memory.py` | 26 | 短期/长期记忆往返、TTL、并发丢更新、引擎切换 |
 | `test_graph_structure.py` | 7 | 编译、fan-out、条件边分叉、**回边存在性**、串行模式 |
 
 **8 个 `gap` 用例**断言的是"当前行为即缺口"，不是期望行为——跑 `make test-gaps` 就能看到待修清单。
 
-### 补测试时挖出的两个真 bug
+### 测试与真机联调挖出的 5 个真 bug
 
-补测试之前，这套系统的护栏部分**没有任何测试**。写测试的过程直接挖出两个会打穿整个流程的缺陷：
+补测试之前，这套系统的护栏部分**没有任何测试**。整个过程挖出 5 个真实缺陷，**其中 2 个会让护栏自身崩溃**。
+
+**补测试阶段（2 个，直接打穿护栏）：**
 
 1. **`rule_based_risk` 崩溃**：`except` 只捕了 `(TypeError, ZeroDivisionError)`，而 `float("1.7米")` 抛的是 **ValueError**。
    画像由 LLM 解析、不做类型强转——用户说"我身高一米七"，模型输出 `"1.7米"`，**整个 graph 就崩在护栏内部**。
 2. **`ensure_disclaimer` 崩溃**：用 `setdefault("meta", {})`，当键存在但值不是字典时（LLM 产出 `{"meta": "无"}`）不替换，下一行 `obj["meta"]["disclaimer"] = ...` 直接抛 `TypeError`。
    这个函数的承诺是"保证免责声明 100% 出现"，结果它自己崩掉 → **免责声明 100% 不出现**，与承诺正好相反。
 
-两个都已修复并有回归用例。
+**真机联调阶段（3 个，只在真实运行时才暴露）：**
+
+3. **工具调用回调完全没生效**（工具事件数 = 0）。回调挂在模型构造函数上只能覆盖 LLM 调用；`create_agent` 内部 ToolNode 的工具调用是另一个 run，拿不到模型上的局部回调。改到 config 层后 0 → 26+ 次。
+4. **用户点"接受"后计划永远写不进长期记忆**。恢复流里不会有任何内容帧——计划是在中断前那一段流里产出的，只看本段流的 `final_json` 永远是空，于是 `save_last_plan` 永不触发。改为从**图状态**取 `final_json`。
+5. **恢复请求会把计划写到错误的用户名下**。前端 `resumeChat` 只发 `{thread_id, decision, feedback}`，后端用默认的 `"default"` 写长期记忆，计划静默落到别人名下。改为从**检查点状态**取 `session_id` / `user_id`（状态才是权威来源）。
+
+5 个都已修复并有回归用例。
 
 ---
 
@@ -237,7 +245,7 @@ health-planner/
 │   ├── mcp_health_server.py    # FastMCP 6 个 mock 工具
 │   ├── health_graph.py         # LangGraph 编排（闸门 + 回边 + 防死循环）
 │   ├── observability.py        # 结构化日志 + Trace + 聚合指标
-│   ├── memory.py               # 分层记忆（fakeredis，可切真 Redis）
+│   ├── memory.py               # 分层记忆（默认真 Redis，无 REDIS_URL 时退回 fakeredis）
 │   ├── state.py                # State + 初始状态 + MAX_REVISIONS
 │   ├── prompts.py              # 各 Agent system prompt
 │   ├── safety.py               # 安全护栏（纯函数，被测试覆盖最密）
@@ -248,7 +256,7 @@ health-planner/
 │   ├── pytest.ini
 │   ├── requirements.txt
 │   ├── requirements-dev.txt    # pytest / pytest-asyncio
-│   ├── tests/                  # 202 个用例
+│   ├── tests/                  # 207 个用例
 │   └── data/checkpoints.sqlite # 中断检查点（gitignore）
 └── frontend/
     └── src/
