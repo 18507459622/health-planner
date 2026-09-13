@@ -163,6 +163,7 @@ async def main():
 
     all_scores = {d: {"single": [], "multi": []} for d in DIMENSIONS}
     all_checks = []
+    all_hitl = []
     out_dir = os.path.join(HERE, "output")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -176,8 +177,10 @@ async def main():
         print("   ✅ 完成")
 
         print("🅱️  多智能体流水线生成中...")
-        multi_json = await multi_agent_generate(tools, profile_input)
-        print("   ✅ 完成")
+        hitl_stats: dict = {}
+        multi_json = await multi_agent_generate(tools, profile_input, hitl_stats)
+        all_hitl.append((label, hitl_stats.get("hitl_interrupts", 0), hitl_stats.get("hitl_types", [])))
+        print(f"   ✅ 完成（人工闸门触发 {hitl_stats.get('hitl_interrupts', 0)} 次）")
 
         print("⚖️  裁判打分中...")
         pair = [("单模型", single_json), ("多智能体", multi_json)]
@@ -228,6 +231,21 @@ async def main():
     print("=" * 60)
     for name, item, ok in all_checks:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name} - {item}")
+    passed = sum(1 for _, _, ok in all_checks if ok)
+    print(f"\n  合计：{passed}/{len(all_checks)} PASS")
+
+    print("\n" + "=" * 60)
+    print("  人工闸门触发情况（HITL）")
+    print("=" * 60)
+    for label, n, types in all_hitl:
+        detail = "、".join(str(t) for t in types) or "无"
+        print(f"  {label}：{n} 次（{detail}）")
+    touched = sum(1 for _, n, _ in all_hitl if n > 0)
+    print(f"\n  {touched}/{len(all_hitl)} 个用例触发了人工闸门")
+    if all_hitl:
+        rate = sum(n for _, n, _ in all_hitl) / len(all_hitl)
+        print(f"  平均每用例 {rate:.2f} 次")
+
     print(f"\n✅ 全部计划已保存到 output/ 目录")
 
 
