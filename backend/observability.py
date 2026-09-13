@@ -102,6 +102,8 @@ def reset_state() -> None:
 # ---------------------------------------------------------------- 事件写入
 
 _LOCK = threading.Lock()
+# 单独一把锁给文件写入：不把磁盘 I/O 的延迟耦合到内存指标的更新上
+_FILE_LOCK = threading.Lock()
 _EVENTS: dict[str, list] = {}
 
 
@@ -139,7 +141,16 @@ def _clip(value):
 
 
 def log_event(event: dict) -> dict:
-    """写一条结构化事件：进内存（供 /api/trace 查询）+ 追加到 JSONL 文件。"""
+    """写一条结构化事件：进内存（供 /api/trace 查询）+ 追加到 JSONL 文件。
+
+    **文件写入必须持锁**。LangGraph 会把同步节点丢进线程池执行，
+    多个线程同时 `open(..., "a")` 再 write，两次写入的字节会互相穿插，
+    产出既不是合法 UTF-8、也不是合法 JSON 的行。
+    实测踩过：`logs/trace.jsonl` 中间出现 `'}"}'` 这样的碎片、
+    出现半个汉字（0xad 起头），整份文件无法被 json / pandas 解析。
+
+    用单独的 `_FILE_LOCK`，不把磁盘 I/O 的延迟耦合到内存指标的更新上。
+    """
     record = {
         "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
         "trace_id": current_trace_id(),
@@ -154,8 +165,10 @@ def log_event(event: dict) -> dict:
                 _EVENTS.pop(stale, None)
     try:
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with _LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with _FILE_LOCK:
+            with _LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line)
     except OSError:
         # 日志盘写不进去不能影响主流程；可观测性失败必须是 fail-open
         pass
@@ -318,6 +331,13 @@ class TraceCallbackHandler(BaseCallbackHandler):
         elapsed = round((time.perf_counter() - started) * 1000, 1)
         usage = _extract_usage(response)
         model = ((getattr(response, "llm_output", None) or {}).get("model_name")) or "unknown"
+        # 单次成本也写进事件：否则事后只能看到总账，无法回答
+        # "哪一次请求最贵"——而这恰恰是优化时最想知道的事
+        cost = round(
+            usage["prompt_tokens"] / 1_000_000 * _PRICE_IN
+            + usage["completion_tokens"] / 1_000_000 * _PRICE_OUT,
+            6,
+        )
         log_event(
             {
                 "kind": "llm",
@@ -326,6 +346,7 @@ class TraceCallbackHandler(BaseCallbackHandler):
                 "ok": True,
                 "model": model,
                 "duration_ms": elapsed,
+                "cost_cny": cost,
                 **usage,
             }
         )
@@ -499,6 +520,9 @@ def snapshot() -> dict:
             "rejected": m["rejected"],
             "accepted_rate": round(m["accepted"] / feedback_total, 4) if feedback_total else None,
         },
+        # 把"这些数字的适用范围"直接写进响应里：多 worker 部署时每个 worker
+        # 各算各的，不写清楚会被当成全局指标读。
+        "scope": "单进程内存聚合（本次 uvicorn 进程启动至今）；多 worker 部署需外部聚合",
     }
 
 
