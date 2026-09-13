@@ -3,6 +3,11 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+# 计划确认环节最多允许用户要求改几轮。
+# 这是"防死循环"的硬闸：confirm_gate 与 adjust_planner 之间是一条真实回边，
+# 没有上限时用户可以无限要求调整，token 成本也随之无上限。
+MAX_REVISIONS = 3
+
 
 class State(TypedDict):
     # 输入
@@ -22,6 +27,11 @@ class State(TypedDict):
     diet_plan: str        # 膳食规划
     exercise_plan: str    # 运动规划
     lifestyle_plan: str   # 作息规划
+    # 人机协同（Human-in-the-loop）
+    risk_ack: bool        # 高风险场景下用户是否确认继续
+    aborted: bool         # 用户在风险闸门选择了中止
+    revision_count: int   # 已发生的计划调整轮数（用于防死循环）
+    revision_request: str # 用户在确认环节写下的调整意见
     # 输出
     final_json: str       # 最终 JSON 字符串
 
@@ -53,5 +63,9 @@ def initial_state(
         "diet_plan": "",
         "exercise_plan": "",
         "lifestyle_plan": "",
+        "risk_ack": False,
+        "aborted": False,
+        "revision_count": 0,
+        "revision_request": "",
         "final_json": "",
     }

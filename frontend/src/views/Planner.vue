@@ -13,18 +13,47 @@
       <el-col :span="16">
         <ProgressSteps :stage="stage" />
         <el-alert v-if="error" :title="error" type="error" show-icon class="mt" :closable="false" />
+        <ConfirmCard
+          v-if="interruptPayload"
+          :payload="interruptPayload"
+          @confirm="handleConfirm"
+        />
         <RiskBanner v-if="plan" :risk="plan.risk" />
         <PlanCard v-if="plan" :plan="plan" />
+
+        <el-card v-if="aborted" class="mt">
+          <template #header>🛑 已中止生成</template>
+          <p class="abort-summary">{{ aborted.summary }}</p>
+          <ul class="abort-steps">
+            <li v-for="(s, i) in aborted.next_steps || []" :key="i">{{ s }}</li>
+          </ul>
+          <p v-if="aborted.meta.abort_reason" class="abort-reason">{{ aborted.meta.abort_reason }}</p>
+        </el-card>
+        <el-alert
+          v-else-if="abortNotice"
+          :title="abortNotice"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="mt"
+        />
 
         <el-card v-if="plan" class="mt">
           <div class="adjust-row">
             <el-input
               v-model="instruction"
               placeholder="调整计划，如：把运动强度调低"
-              :disabled="loading"
+              :disabled="loading || !!interruptPayload"
               @keyup.enter="handleAdjust"
             />
-            <el-button type="primary" :loading="loading" @click="handleAdjust">调整</el-button>
+            <el-button
+              type="primary"
+              :loading="loading"
+              :disabled="!!interruptPayload"
+              @click="handleAdjust"
+            >
+              调整
+            </el-button>
           </div>
           <el-divider />
           <div class="export-row">
@@ -44,9 +73,20 @@ import ProfileForm from '@/components/ProfileForm.vue'
 import ProgressSteps from '@/components/ProgressSteps.vue'
 import RiskBanner from '@/components/RiskBanner.vue'
 import PlanCard from '@/components/PlanCard.vue'
-import { streamChat } from '@/api/sse'
+import ConfirmCard from '@/components/ConfirmCard.vue'
+import { resumeChat, streamChat } from '@/api/sse'
+import type { StreamHandlers } from '@/api/sse'
 import { downloadFile, planToMarkdown, planToText } from '@/utils/export'
-import type { PlanJson, ProfileInput, StoredProfile, WeightEntry } from '@/types/plan'
+import type {
+  AbortedPlan,
+  ConfirmDecision,
+  FinalPayload,
+  InterruptPayload,
+  PlanJson,
+  ProfileInput,
+  StoredProfile,
+  WeightEntry,
+} from '@/types/plan'
 
 const loading = ref(false)
 const error = ref('')
@@ -55,9 +95,19 @@ const stage = ref(0)
 const instruction = ref('')
 const profile = ref<StoredProfile | null>(null)
 const weightHistory = ref<WeightEntry[]>([])
+// 人机协同：闸门暂停时暂存确认载荷和线程号，用户确认后靠它们恢复执行
+const interruptPayload = ref<InterruptPayload | null>(null)
+const threadId = ref('')
+const traceId = ref('')
+// 风险闸门选「中止」时后端给的是就医建议，没有计划字段，所以单独存
+const aborted = ref<AbortedPlan | null>(null)
+const abortNotice = ref('')
 
 const sessionId = crypto.randomUUID()
 const userId = 'default'
+
+// 已完成的节点跨「恢复」保留：同一轮对话里进度只能往前追加，不能因为中断而回退
+let completed = new Set<string>()
 
 function stageOf(completed: Set<string>): number {
   if (completed.has('plan_composer')) return 4
@@ -88,28 +138,83 @@ async function loadMemory() {
   }
 }
 
+/** 中止时后端返回的是就医建议对象（meta.aborted），字段结构与完整计划不同。 */
+function isAborted(p: FinalPayload): p is AbortedPlan {
+  return (p.meta as { aborted?: boolean }).aborted === true
+}
+
+/** 首轮流与恢复流共用同一套回调，这样恢复后的节点进度才能接着往上累加。 */
+function streamHandlers(): StreamHandlers {
+  return {
+    onTrace: (id) => {
+      traceId.value = id
+    },
+    onIntent: (intent) => {
+      if (intent === 'adjust') stage.value = 3
+    },
+    onStep: (e) => {
+      completed.add(e.node)
+      stage.value = stageOf(completed)
+    },
+    onDone: (p) => {
+      abortNotice.value = ''
+      if (isAborted(p)) {
+        // 中止分支不产出计划，PlanCard 会因缺 diet/exercise 字段渲染报错，所以分开存
+        aborted.value = p
+        plan.value = null
+      } else {
+        plan.value = p
+        aborted.value = null
+        stage.value = 4
+      }
+    },
+    onInterrupt: (payload, tid) => {
+      interruptPayload.value = payload
+      threadId.value = tid
+      // 图已经暂停，再转圈会让用户误以为还在生成
+      loading.value = false
+    },
+    onError: (msg) => {
+      // 中断相关问题要拿 trace_id 去对齐后端日志，所以直接带到错误信息里
+      error.value = traceId.value ? `${msg}（trace_id: ${traceId.value}）` : msg
+    },
+  }
+}
+
 async function runFlow(message: string) {
   loading.value = true
   error.value = ''
   stage.value = 0
-  const completed = new Set<string>()
+  completed = new Set<string>()
+  interruptPayload.value = null // 新一轮对话作废上一轮遗留的确认卡片
+  aborted.value = null
+  abortNotice.value = ''
   try {
-    await streamChat(message, sessionId, userId, {
-      onIntent: (intent) => {
-        if (intent === 'adjust') stage.value = 3
-      },
-      onStep: (e) => {
-        completed.add(e.node)
-        stage.value = stageOf(completed)
-      },
-      onDone: (p) => {
-        plan.value = p
-        stage.value = 4
-      },
-      onError: (msg) => {
-        error.value = msg
-      },
-    })
+    await streamChat(message, sessionId, userId, streamHandlers())
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 用户在确认卡片上做了选择：带上 thread_id 恢复被闸门暂停的图。 */
+async function handleConfirm(decision: ConfirmDecision) {
+  const tid = threadId.value
+  interruptPayload.value = null
+  if (!tid) {
+    // 没有 thread_id 就恢复不了，明确报错好过静默卡住
+    error.value = '缺少 thread_id，无法继续本次执行，请重新生成计划。'
+    return
+  }
+  if (decision.decision === 'abort') {
+    abortNotice.value = '已按你的选择中止，本次不会生成健康计划；建议先就医评估。'
+  }
+  loading.value = true
+  error.value = ''
+  try {
+    // 这里刻意不重置 stage / completed：恢复后进度要在现有基础上继续往下走
+    await resumeChat(tid, decision.decision, decision.feedback, streamHandlers())
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -124,7 +229,7 @@ async function handleGenerate(payload: ProfileInput) {
 
 function handleAdjust() {
   const text = instruction.value.trim()
-  if (!text || loading.value) return
+  if (!text || loading.value || interruptPayload.value) return
   instruction.value = ''
   runFlow(text)
 }
@@ -163,5 +268,19 @@ onMounted(loadMemory)
 .export-label {
   color: #606266;
   font-size: 13px;
+}
+.abort-summary {
+  margin: 0 0 8px;
+}
+.abort-steps {
+  margin: 0;
+  padding-left: 20px;
+  color: #606266;
+  line-height: 1.8;
+}
+.abort-reason {
+  margin: 12px 0 0;
+  color: #909399;
+  font-size: 12px;
 }
 </style>

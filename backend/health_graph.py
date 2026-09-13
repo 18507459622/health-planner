@@ -1,15 +1,31 @@
-"""健康计划生成助手 - LangGraph 编排核心（含记忆）。
+"""健康计划生成助手 - LangGraph 编排核心（含记忆 + 人机协同）。
+
+架构选型（面试常问：为什么是 workflow，而不是让 LLM 自主编排？）
+----------------------------------------------------------------
+健康场景的评估维度是固定的：画像 → 风险 → 膳食 / 运动 / 作息 → 合成。
+少跑一个维度不是"更灵活"，而是漏掉一项安全评估，属于事故。
+所以这里刻意选择「稳定 workflow + 节点内 ReAct」，而不是自主多智能体：
+
+  * 编排由 LangGraph 静态 DAG 决定 —— 可审计、可复现、可测试；
+  * 每个规划节点内部才是 create_agent 的 ReAct 循环 —— 在那里让模型决定调哪个工具；
+  * 风险等级由确定性规则层兜底 —— 不交给 LLM 单方面判断。
+
+《什么样的 Agent 项目才算好项目》原话："多 Agent 不是越多越好……
+用稳定 workflow 反而更可控。好的架构不是炫技，而是匹配业务。"
 
 技术亮点：
-1. LangGraph —— 用「图」编排多智能体工作流：意图路由 + 三路并行 fan-out
-2. MCP —— 为多个智能体接入本地健康工具（BMI 计算 / 健康知识 / 食物营养 / 运动指南等）
+1. LangGraph —— 图编排：意图路由 + 三路并行 fan-out + 一条带上限的回边
+2. MCP —— 为规划节点接入本地健康工具（BMI / 健康知识 / 食物营养 / 运动指南等）
 3. 记忆 —— 短期（会话多轮）+ 长期（画像 / 体重历史 / 上一版计划）分层记忆
+4. 人机协同 —— 高风险闸门 + 计划确认闸门（LangGraph interrupt + checkpointer）
+5. 可观测性 —— trace_id 贯穿请求 / 节点 / 模型 / 工具，见 observability.py
 
 工作流图：
-  START ─┬─ generate → 画像解析 → 健康评估 ─┬─ 膳食规划 ─┐
-         │                                ├─ 运动规划 ─┼→ 计划合成 → END
-         │                                └─ 作息规划 ─┘
-         └─ adjust   → 计划调整（基于上一版计划 + 追问）──────────→ END
+  START ─┬─ generate → 画像解析 → 健康评估 → 风险闸门 ─┬─(中止)→ 就医建议 → END
+         │                                            └─(继续)→ 膳食 ──┐
+         │                                                     ├ 运动 ──┼→ 计划合成 → 计划确认 ─┬(接受)→ END
+         │                                                     └ 作息 ──┘                       └(调整,≤3轮)→ 计划调整 ─┘
+         └─ adjust → 计划调整 → 计划确认
 
 运行：.venv/Scripts/python.exe cli.py（命令行）或 server.py（Web）
 """
@@ -32,7 +48,9 @@ from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
+from observability import TraceCallbackHandler, timed_node
 from prompts import PROMPTS
 from safety import (
     DISCLAIMER,
@@ -42,7 +60,7 @@ from safety import (
     rule_based_risk,
     stricter_level,
 )
-from state import State
+from state import MAX_REVISIONS, State
 
 load_dotenv()
 
@@ -70,6 +88,26 @@ def detect_intent(message: str, last_plan: str) -> str:
 
 
 # ---------- 1. 大模型工厂 ----------
+# 一个回调处理器实例即可：内部按 run_id 区分并发调用。
+_TRACE_HANDLER = TraceCallbackHandler()
+
+
+def run_config(thread_id: str | None = None) -> dict:
+    """统一的调用配置：可观测回调 + 可选的检查点线程。
+
+    回调必须放在 **config 层**，不能挂在模型构造函数上——
+    挂在模型上只能覆盖 LLM 调用；create_agent 内部 ToolNode 发起的
+    工具调用是另一个 run，拿不到模型上的局部回调（实测工具事件数为 0）。
+    放在 config 上，整棵调用树（节点 / 模型 / 工具 / 链）都会继承它。
+
+    注意不要两处都挂：那样每个 LLM 调用会被记两次，token 统计翻倍。
+    """
+    cfg: dict = {"callbacks": [_TRACE_HANDLER]}
+    if thread_id:
+        cfg["configurable"] = {"thread_id": thread_id}
+    return cfg
+
+
 def make_llm(temperature: float = 0.7, json_mode: bool = False) -> ChatOpenAI:
     kwargs: dict = {"max_retries": 3}
     if json_mode:
@@ -250,6 +288,207 @@ def adjust_planner_node(state: State) -> dict:
     return {"final_json": final}
 
 
+# ---------- 2.5 人机协同闸门（Human-in-the-loop） ----------
+# 《什么样的 Agent 项目才算好项目》第六节：好的 Agent 不是所有事情都自动做到底，
+# 在关键节点上它应该主动让人确认；高风险操作失败后要转人工。
+# 企业真正关心的不是 Agent 多聪明，而是它能不能「可控地」完成任务。
+#
+# 实现依赖 LangGraph 的 interrupt + checkpointer：
+#   interrupt() 抛出一个特殊信号，把当前状态存进 checkpointer 并结束本次调用；
+#   之后用同一个 thread_id 调 Command(resume=值)，节点会从头重跑，
+#   此时 interrupt() 直接返回那个 resume 值。
+# 因此闸门节点在 interrupt() 之前不能有任何副作用，否则重跑时会重复执行。
+
+_ABORT_WORDS = (
+    "abort", "cancel", "reject", "false", "stop", "no",
+    "中止", "取消", "暂不", "先不", "看医生", "不继续",
+)
+_GO_WORDS = (
+    "continue", "accept", "true", "yes", "ok", "proceed",
+    "继续", "生成", "接受", "确认", "好的",
+)
+_REVISE_WORDS = (
+    "revise", "adjust", "modify", "change",
+    "调整", "修改", "重来", "不满意", "改", "换",
+)
+
+
+def _decision_text(decision) -> str:
+    """把恢复值归一化成小写文本；兼容裸字符串与 {"decision": ...} 两种前端传法。"""
+    if isinstance(decision, dict):
+        for key in ("decision", "value", "choice", "answer"):
+            if decision.get(key):
+                return str(decision[key]).strip().lower()
+        return str(decision).strip().lower()
+    return str(decision).strip().lower()
+
+
+def _matches(text: str, words: tuple) -> bool:
+    return any(w in text for w in words)
+
+
+def risk_gate_node(state: State) -> dict:
+    """高风险闸门：评估判定需要就医时，先停下来让用户确认。
+
+    识别不出用户意图时按「中止」处理（fail-closed）。
+    这个方向是刻意的：在需要就医的场景里，误判成「继续」的代价远大于误判成「中止」。
+    """
+    if not state.get("need_medical"):
+        return {"risk_ack": True, "aborted": False}
+
+    decision = interrupt({
+        "type": "risk_confirmation",
+        "title": "需要就医提示确认",
+        "question": "健康评估提示你需要就医。是否仍要继续生成健康计划？",
+        "risk_level": state.get("risk_level", "unknown"),
+        "bmi": rule_based_risk(state.get("profile_input") or {}).get("bmi"),
+        "options": [
+            {"value": "continue", "label": "我已了解，继续生成", "style": "default"},
+            {"value": "abort", "label": "先去看医生，暂不生成", "style": "danger"},
+        ],
+        "hint": "选择中止不会生成计划，只会给出就医建议。",
+    })
+
+    text = _decision_text(decision)
+    if _matches(text, _ABORT_WORDS):
+        return {"risk_ack": False, "aborted": True}
+    if _matches(text, _GO_WORDS):
+        return {"risk_ack": True, "aborted": False}
+    return {"risk_ack": False, "aborted": True}  # fail-closed
+
+
+def confirm_gate_node(state: State) -> dict:
+    """计划确认闸门：产出计划后停下来问用户接不接受。
+
+    与风险闸门的区别是这个闸门会形成一条真实回边
+    （confirm_gate → adjust_planner → confirm_gate），
+    所以必须有 MAX_REVISIONS 上限——这就是「防死循环」：
+    没有上限时用户可以无限要求调整，token 成本也随之无上限。
+    """
+    revisions = state.get("revision_count", 0)
+    if revisions >= MAX_REVISIONS:
+        # 已到上限：不再询问，直接放行结束
+        return {"revision_request": ""}
+
+    decision = interrupt({
+        "type": "plan_confirmation",
+        "title": "计划确认",
+        "question": "这份计划是否符合预期？",
+        "revision_count": revisions,
+        "max_revisions": MAX_REVISIONS,
+        "options": [
+            {"value": "accept", "label": "接受这份计划", "style": "primary"},
+            {"value": "revise", "label": "需要调整", "style": "default"},
+        ],
+        "hint": f"还可以调整 {MAX_REVISIONS - revisions} 轮。",
+    })
+
+    text = _decision_text(decision)
+    feedback = ""
+    if isinstance(decision, dict):
+        feedback = str(decision.get("feedback") or decision.get("comment") or "").strip()
+
+    if _matches(text, _REVISE_WORDS):
+        new_message = feedback or state.get("message", "")
+        return {
+            "revision_count": revisions + 1,
+            "revision_request": new_message,
+            "message": new_message,
+        }
+    return {"revision_request": ""}
+
+
+def abort_node(state: State) -> dict:
+    """用户在风险闸门选择中止：不生成任何计划，只给出就医建议。
+
+    这条分支本身就是护栏的一部分——系统提供「不做事」的选项，
+    而不是无论用户怎么选都要产出一份计划。
+    """
+    obj = {
+        "meta": {"aborted": True, "abort_reason": "用户在风险闸门选择先就医"},
+        "summary": "已按你的选择停止生成健康计划。",
+        "profile": {"bmi": rule_based_risk(state.get("profile_input") or {}).get("bmi")},
+        "risk": {"level": state.get("risk_level", "high"), "need_medical": True},
+        "next_steps": [
+            "带上近期体检报告或既往病史，先去正规医院相应科室就诊",
+            "由医生评估之后再决定是否适合开始减脂 / 增肌 / 运动计划",
+            "如果已经拿到医生的意见，可以回来重新生成，并告知医生给出的限制",
+        ],
+        "assessment": state.get("assessment", ""),
+    }
+    obj = ensure_disclaimer(obj)
+    final = json.dumps(obj, ensure_ascii=False, indent=2)
+    show("🛑 用户中止 → 就医建议", final, preview=600)
+    return {"final_json": final, "aborted": True}
+
+
+def plan_fanout_node(state: State) -> dict:
+    """三路规划的分发点（空节点）。
+
+    LangGraph 的 add_conditional_edges 不支持「一个分支映射到多个节点」：
+    传入 list 会被静默接受，但 compile 时抛 TypeError: unhashable type: 'list'
+    （langgraph 1.2.11 实测）。所以这里显式放一个空节点承担分发——
+    条件边只负责判断「是否中止」，分发交给普通边完成。
+    """
+    return {}
+
+
+def route_after_risk_gate(state: State) -> str:
+    return "abort" if state.get("aborted") else "plan"
+
+
+def route_after_confirm(state: State) -> str:
+    return "revise" if state.get("revision_request") else "accept"
+
+
+# ---------- 2.6 中断处理（非交互入口共用） ----------
+# 兜底上限：风险闸门最多触发 1 次，确认闸门最多 MAX_REVISIONS + 1 次，
+# 正常情况下不会到这里；留着是防止改图时不小心造出无限请求人工的环。
+MAX_INTERRUPTS = 8
+
+# 无人值守时的默认应答。评测必须能跑完，所以取「继续 / 接受」；
+# 交互入口（server.py / cli.py）不走这里——那里必须把决定权交给人。
+AUTO_ANSWER = {"risk_confirmation": "continue", "plan_confirmation": "accept"}
+
+
+def extract_interrupt(result) -> dict | None:
+    """从 graph 调用结果里取出中断载荷；没有中断则返回 None。
+
+    LangGraph 把中断放在结果的 `__interrupt__` 键下，值是一个元组，
+    元素为 Interrupt 对象，真正的内容在它的 .value 上。
+    """
+    if not isinstance(result, dict):
+        return None
+    raw = result.get("__interrupt__")
+    if not raw:
+        return None
+    first = raw[0] if isinstance(raw, (tuple, list)) else raw
+    return getattr(first, "value", first)
+
+
+async def run_to_completion(graph, initial, config=None, auto_answer: bool = True):
+    """跑图直到结束，遇到闸门时按 AUTO_ANSWER 自动应答。
+
+    这是给**非交互入口**（eval.py 评测脚本）用的。
+    返回 (最终状态, 触发过的中断载荷列表)——后者可以统计
+    "这套评测集里有多少用例会触发人工确认"，本身就是个可汇报的指标。
+    """
+    from langgraph.types import Command
+
+    state = await graph.ainvoke(initial, config=config)
+    interrupts: list = []
+    for _ in range(MAX_INTERRUPTS):
+        payload = extract_interrupt(state)
+        if payload is None:
+            break
+        interrupts.append(payload)
+        if not auto_answer:
+            break
+        answer = AUTO_ANSWER.get(payload.get("type"), "accept")
+        state = await graph.ainvoke(Command(resume=answer), config=config)
+    return state, interrupts
+
+
 # ---------- 3. 带工具的 Agent（在 build_graph 里用 MCP 工具初始化） ----------
 ASSESSOR_AGENT = None
 DIET_AGENT = None
@@ -257,7 +496,14 @@ EXERCISE_AGENT = None
 LIFESTYLE_AGENT = None
 
 
-def build_graph(tools):
+def build_graph(tools, checkpointer=None):
+    """构建并编译图。
+
+    checkpointer 是人机协同的前提：interrupt 会把图状态存进 checkpointer，
+    之后用同一个 thread_id 调 Command(resume=...) 才能接着跑。
+    server.py 传 AsyncSqliteSaver（落盘，服务重启后仍可恢复）；
+    cli.py / 测试传 MemorySaver（仅进程内）。
+    """
     global ASSESSOR_AGENT, DIET_AGENT, EXERCISE_AGENT, LIFESTYLE_AGENT
     t = {x.name: x for x in tools}
     ASSESSOR_AGENT = create_agent(
@@ -278,33 +524,48 @@ def build_graph(tools):
     )
 
     g = StateGraph(State)
-    g.add_node("profile_parser", profile_parser_node)
-    g.add_node("health_assessor", health_assessor_node)
-    g.add_node("diet_planner", diet_planner_node)
-    g.add_node("exercise_planner", exercise_planner_node)
-    g.add_node("lifestyle_planner", lifestyle_planner_node)
-    g.add_node("plan_composer", plan_composer_node)
-    g.add_node("adjust_planner", adjust_planner_node)
+    g.add_node("profile_parser", timed_node("profile_parser", profile_parser_node))
+    g.add_node("health_assessor", timed_node("health_assessor", health_assessor_node))
+    g.add_node("risk_gate", timed_node("risk_gate", risk_gate_node))
+    g.add_node("abort", timed_node("abort", abort_node))
+    g.add_node("plan_fanout", timed_node("plan_fanout", plan_fanout_node))
+    g.add_node("diet_planner", timed_node("diet_planner", diet_planner_node))
+    g.add_node("exercise_planner", timed_node("exercise_planner", exercise_planner_node))
+    g.add_node("lifestyle_planner", timed_node("lifestyle_planner", lifestyle_planner_node))
+    g.add_node("plan_composer", timed_node("plan_composer", plan_composer_node))
+    g.add_node("confirm_gate", timed_node("confirm_gate", confirm_gate_node))
+    g.add_node("adjust_planner", timed_node("adjust_planner", adjust_planner_node))
 
-    # 意图路由：首次生成走完整流程，追问调整走调整节点
+    # 意图路由：首次生成走完整流程，追问调整直接进调整节点
     g.add_conditional_edges(
         START, lambda s: s["intent"], {"generate": "profile_parser", "adjust": "adjust_planner"}
     )
     g.add_edge("profile_parser", "health_assessor")
 
+    # 高风险闸门：需要就医时先停下来让人确认，确认继续才进三路规划
+    g.add_edge("health_assessor", "risk_gate")
+    g.add_conditional_edges(
+        "risk_gate", route_after_risk_gate, {"plan": "plan_fanout", "abort": "abort"}
+    )
+    g.add_edge("abort", END)
+
     if PARALLEL:
-        g.add_edge("health_assessor", "diet_planner")
-        g.add_edge("health_assessor", "exercise_planner")
-        g.add_edge("health_assessor", "lifestyle_planner")
+        g.add_edge("plan_fanout", "diet_planner")
+        g.add_edge("plan_fanout", "exercise_planner")
+        g.add_edge("plan_fanout", "lifestyle_planner")
         g.add_edge("diet_planner", "plan_composer")
         g.add_edge("exercise_planner", "plan_composer")
         g.add_edge("lifestyle_planner", "plan_composer")
     else:
-        g.add_edge("health_assessor", "diet_planner")
+        g.add_edge("plan_fanout", "diet_planner")
         g.add_edge("diet_planner", "exercise_planner")
         g.add_edge("exercise_planner", "lifestyle_planner")
         g.add_edge("lifestyle_planner", "plan_composer")
 
-    g.add_edge("plan_composer", END)
-    g.add_edge("adjust_planner", END)
-    return g.compile()
+    # 计划确认闸门 + 带上限的回边（防死循环）
+    g.add_edge("plan_composer", "confirm_gate")
+    g.add_conditional_edges(
+        "confirm_gate", route_after_confirm, {"accept": END, "revise": "adjust_planner"}
+    )
+    g.add_edge("adjust_planner", "confirm_gate")
+    return g.compile(checkpointer=checkpointer)

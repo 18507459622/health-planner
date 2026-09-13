@@ -20,7 +20,11 @@ def rule_based_risk(profile: dict) -> dict:
     if height_cm and weight_kg:
         try:
             bmi = round(float(weight_kg) / ((float(height_cm) / 100) ** 2), 1)
-        except (TypeError, ZeroDivisionError):
+        except (TypeError, ValueError, ZeroDivisionError):
+            # ValueError 必须一并捕获：height_cm / weight_kg 直接来自
+            # profile_parser_node 解析出的 LLM JSON，没有任何类型强转。
+            # 用户说"我身高一米七"，模型可能输出 "1.7米"、"170cm" 这类字符串，
+            # float() 会抛 ValueError——只捕 TypeError 会让整个 graph 崩在护栏内部。
             bmi = None
     level, need_medical = "low", False
     if bmi is not None:
@@ -70,6 +74,11 @@ def ensure_disclaimer(obj) -> dict:
     """无条件覆盖 meta.disclaimer，保证免责声明 100% 出现。"""
     if not isinstance(obj, dict):
         obj = {"raw": str(obj)}
-    obj.setdefault("meta", {})
+    if not isinstance(obj.get("meta"), dict):
+        # 这里不能用 setdefault：键存在但值不是字典时它不会替换，
+        # 下一行 obj["meta"]["disclaimer"] = ... 会直接抛 TypeError。
+        # LLM 产出 {"meta": "无"} 这类结构完全可能，而护栏一旦崩掉，
+        # 免责声明就 100% 不出现——与本函数的承诺正好相反。
+        obj["meta"] = {}
     obj["meta"]["disclaimer"] = DISCLAIMER
     return obj

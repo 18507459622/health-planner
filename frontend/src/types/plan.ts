@@ -81,6 +81,68 @@ export interface PlanEvent {
   final: boolean
 }
 
+// ---------- 人机协同（Human-in-the-loop）中断相关 ----------
+// 图执行到闸门（风险确认 / 计划确认）时会暂停，SSE 流里出现一帧中断事件，
+// 前端渲染成确认卡片，用户做出选择后再调 /api/chat/resume 恢复执行。
+
+export interface InterruptOption {
+  value: string
+  label: string
+  /** 按钮语义，直接映射到 Element Plus 的按钮 type；后端漏传时按次要按钮处理 */
+  style?: 'primary' | 'default' | 'danger'
+}
+
+export interface InterruptPayload {
+  /** risk_confirmation（需就医确认） | plan_confirmation（计划确认） */
+  type: string
+  title: string
+  question: string
+  options: InterruptOption[]
+  hint?: string
+  /** 仅 risk_confirmation：风险等级，画像算不出来时后端给 unknown */
+  risk_level?: string
+  /** 仅 risk_confirmation：BMI，画像缺失时为 null（此时不展示） */
+  bmi?: number | null
+  /** 仅 plan_confirmation：已调整轮数 */
+  revision_count?: number
+  /** 仅 plan_confirmation：允许调整的轮数上限（防用户无限要求调整） */
+  max_revisions?: number
+}
+
+/** 中断帧：收到它代表流程已暂停，必须由用户确认后才能继续 */
+export interface InterruptEvent {
+  type: 'interrupt'
+  thread_id: string
+  interrupt: InterruptPayload
+  trace_id?: string
+}
+
+/** 首帧追踪事件：把前端现象跟后端日志对齐时要用它 */
+export interface TraceEvent {
+  type: 'trace'
+  trace_id: string
+}
+
+/** 用户在确认卡片上做出的决定，也就是 /api/chat/resume 的请求体内容 */
+export interface ConfirmDecision {
+  decision: string
+  /** 只在「需要调整」时有值，其余情况为空串 */
+  feedback: string
+}
+
+/** 风险闸门选择中止时后端给出的「就医建议」，没有 diet / exercise 等计划字段 */
+export interface AbortedPlan {
+  meta: { aborted: boolean; abort_reason: string }
+  summary: string
+  profile: { bmi: number | null }
+  risk: { level: string; need_medical: boolean }
+  next_steps: string[]
+  assessment: string
+}
+
+/** 最终帧（final: true）的两种形态：完整计划，或用户中止后的就医建议 */
+export type FinalPayload = PlanJson | AbortedPlan
+
 export interface ChatMessage {
   role: 'user' | 'assistant'
   text: string

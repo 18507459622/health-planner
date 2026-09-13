@@ -15,6 +15,7 @@ import os
 import random
 import re
 import sys
+import uuid
 
 # Windows 控制台默认 GBK，emoji 会报 UnicodeEncodeError；强制 UTF-8 输出
 for _s in (sys.stdout, sys.stderr):
@@ -27,6 +28,7 @@ for _s in (sys.stdout, sys.stderr):
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.checkpoint.memory import MemorySaver
 
 import health_graph as hg
 from safety import DISCLAIMER, ensure_disclaimer, extract_json, rule_based_risk
@@ -95,12 +97,25 @@ def format_profile_message(p: dict) -> str:
     )
 
 
-async def multi_agent_generate(tools, profile_input: dict) -> str:
-    """多智能体：跑完整 LangGraph 流水线。"""
-    graph = hg.build_graph(tools)
+async def multi_agent_generate(tools, profile_input: dict, stats: dict | None = None) -> str:
+    """多智能体：跑完整 LangGraph 流水线。
+
+    图上现在有两个人工确认闸门，而评测是无人值守的，
+    所以用 run_to_completion 自动应答（风险闸门=继续、确认闸门=接受）。
+    触发了几次闸门会记进 stats ——「多少用例需要人工介入」本身就是要汇报的指标，
+    也是衡量的前提：如果 100% 的用例都触发风险闸门，闸门就形同虚设。
+    """
+    graph = hg.build_graph(tools, checkpointer=MemorySaver())
     message = format_profile_message(profile_input)
-    result = await graph.ainvoke(initial_state(message=message, intent="generate"))
-    return result["final_json"]
+    result, interrupts = await hg.run_to_completion(
+        graph,
+        initial_state(message=message, intent="generate"),
+        config=hg.run_config(f"eval:{uuid.uuid4().hex[:8]}"),
+    )
+    if stats is not None:
+        stats["hitl_interrupts"] = len(interrupts)
+        stats["hitl_types"] = [i.get("type") for i in interrupts]
+    return result.get("final_json", "")
 
 
 def judge(text_a: str, text_b: str, profile_input: dict) -> dict:

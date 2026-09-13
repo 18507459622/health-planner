@@ -12,3 +12,9 @@ dist/
 # 产物
 output/
 *.log
+
+# 测试与本地环境
+.pytest_cache/
+.backup-*/
+backend/data/
+logs/
